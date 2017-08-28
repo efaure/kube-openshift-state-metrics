@@ -33,6 +33,9 @@ import (
 	"k8s.io/client-go/pkg/api"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	occlientcmd "github.com/openshift/origin/pkg/cmd/util/clientcmd"
+	occlient "github.com/openshift/origin/pkg/client"
+	"k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/efaure/kube-openshift-state-metrics/collectors"
 )
@@ -58,6 +61,7 @@ var (
 		"statefulsets":           struct{}{},
 		"persistentvolumeclaims": struct{}{},
 		"namespaces":             struct{}{},
+		"deploymentconfiguration": struct{}{},
 	}
 	availableCollectors = map[string]func(registry prometheus.Registerer, kubeClient clientset.Interface, namespace string){
 		"cronjobs":               collectors.RegisterCronJobCollector,
@@ -74,6 +78,9 @@ var (
 		"statefulsets":           collectors.RegisterStatefulSetCollector,
 		"persistentvolumeclaims": collectors.RegisterPersistentVolumeClaimCollector,
 		"namespaces":             collectors.RegisterNamespaceCollector,
+	}
+	availableOpenShiftCollectors = map[string]func(registry prometheus.Registerer,ocClient *occlient.Client, namespace string){
+		"deploymentconfiguration":               collectors.RegisterDeploymentConfigurationCollector,
 	}
 )
 
@@ -177,13 +184,13 @@ func main() {
 
 	proc.StartReaper()
 
-	kubeClient, err := createKubeClient(options.inCluster, options.apiserver, options.kubeconfig)
+	kubeClient, ocClient , err := createKubeClient(options.inCluster, options.apiserver, options.kubeconfig)
 	if err != nil {
 		glog.Fatalf("Failed to create client: %v", err)
 	}
 
 	registry := prometheus.NewRegistry()
-	registerCollectors(registry, kubeClient, collectors, options.namespace)
+	registerCollectors(registry, kubeClient,ocClient, collectors, options.namespace)
 	metricsServer(registry, options.port)
 }
 
@@ -195,11 +202,12 @@ func isNotExists(file string) bool {
 	return os.IsNotExist(err)
 }
 
-func createKubeClient(inCluster bool, apiserver string, kubeconfig string) (kubeClient clientset.Interface, err error) {
+func createKubeClient(inCluster bool, apiserver string, kubeconfig string) (kubeClient clientset.Interface, ocClient *occlient.Client, err error) {
+
 	if inCluster {
 		config, err := rest.InClusterConfig()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// Allow overriding of apiserver even if using inClusterConfig
 		// (necessary if kube-proxy isn't properly set up).
@@ -213,7 +221,7 @@ func createKubeClient(inCluster bool, apiserver string, kubeconfig string) (kube
 		glog.Infof("service account token present: %v", tokenPresent)
 		glog.Infof("service host: %s", config.Host)
 		if kubeClient, err = clientset.NewForConfig(config); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
 		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -225,12 +233,20 @@ func createKubeClient(inCluster bool, apiserver string, kubeconfig string) (kube
 		config, err := kubeConfig.ClientConfig()
 		//config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
 		//config, err := clientcmd.DefaultClientConfig.ClientConfig()
+
+
+
+
+		factory := occlientcmd.NewClientAccessFactory(kubeConfig)
+
+		ocClient, _, err = factory.Clients()
 		if err != nil {
-			return nil, err
+			return nil, nil, fmt.Errorf("ERROR retrieving oc client: %v", err)
 		}
+
 		kubeClient, err = clientset.NewForConfig(config)
 		if err != nil {
-			return nil, err
+			return nil,nil, err
 		}
 	}
 
@@ -240,11 +256,28 @@ func createKubeClient(inCluster bool, apiserver string, kubeconfig string) (kube
 	glog.Infof("Testing communication with server")
 	_, err = kubeClient.Discovery().ServerVersion()
 	if err != nil {
-		return nil, fmt.Errorf("ERROR communicating with apiserver: %v", err)
+		return nil, nil, fmt.Errorf("ERROR communicating with apiserver: %v", err)
 	}
 	glog.Infof("Communication with server successful")
 
-	return kubeClient, nil
+	// Just for test
+	buildconfigs, err := ocClient.BuildConfigs("eloise-test").List(v1.ListOptions{})
+	if err != nil {
+		return nil, nil,  fmt.Errorf("ERROR testing to retrieve build config with oc client: %v", err)
+	}
+	for _, buildconfig := range buildconfigs.Items {
+		fmt.Printf("BuildConfig: %s\n", buildconfig.Name)
+	}
+
+	glog.Infof("Testing communication with server with openshift client")
+	_, err = ocClient.Discovery().ServerVersion()
+	if err != nil {
+		return nil, nil, fmt.Errorf("ERROR communicating with apiserver: with openshift client  %v", err)
+	}
+	glog.Infof("Communication with server with openshift client successful")
+
+
+	return kubeClient,ocClient, nil
 }
 
 func metricsServer(registry prometheus.Gatherer, port int) {
@@ -277,15 +310,25 @@ func metricsServer(registry prometheus.Gatherer, port int) {
 
 // registerCollectors creates and starts informers and initializes and
 // registers metrics for collection.
-func registerCollectors(registry prometheus.Registerer, kubeClient clientset.Interface, enabledCollectors collectorSet, namespace string) {
-	activeCollectors := []string{}
+func registerCollectors(registry prometheus.Registerer, kubeClient clientset.Interface, ocClient *occlient.Client, enabledCollectors collectorSet, namespace string) {
+	activeKubeCollectors := []string{}
+	activeOpenShiftCollectors := []string{}
 	for c, _ := range enabledCollectors {
 		f, ok := availableCollectors[c]
 		if ok {
 			f(registry, kubeClient, namespace)
-			activeCollectors = append(activeCollectors, c)
+			activeKubeCollectors = append(activeKubeCollectors, c)
 		}
 	}
 
-	glog.Infof("Active collectors: %s", strings.Join(activeCollectors, ","))
+	for c, _ := range enabledCollectors {
+		f, ok := availableOpenShiftCollectors[c]
+		if ok {
+			f(registry, ocClient, namespace)
+			activeOpenShiftCollectors = append(activeOpenShiftCollectors, c)
+		}
+	}
+
+
+	glog.Infof("Active collectors: %s", strings.Join(activeKubeCollectors, ","))
 }
