@@ -34,7 +34,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"k8s.io/kube-state-metrics/collectors"
+	"github.com/efaure/kube-openshift-state-metrics/collectors"
 )
 
 const (
